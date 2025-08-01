@@ -223,9 +223,14 @@ class UnslothTrainer(SFTTrainer):
             )
         return self.optimizer
 
-    def training_step(self, model, inputs):
+    def training_step(self, model, inputs, num_items_in_batch=None):
         """
         Enhanced training step with multi-GPU support.
+
+        Args:
+            model: The model to train
+            inputs: The input batch
+            num_items_in_batch: Number of items in the batch (for gradient accumulation)
         """
         model.train()
         inputs = self._prepare_inputs(inputs)
@@ -237,14 +242,29 @@ class UnslothTrainer(SFTTrainer):
                 self.accelerator.backward(loss)
                 return loss.detach()
         else:
-            # Fallback to standard training step
-            return super().training_step(model, inputs)
+            # Fallback to standard training step - pass num_items_in_batch if supported
+            try:
+                return super().training_step(model, inputs, num_items_in_batch)
+            except TypeError:
+                # Fallback for older versions that don't support num_items_in_batch
+                return super().training_step(model, inputs)
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         Enhanced loss computation with proper scaling for multi-GPU.
+
+        Args:
+            model: The model
+            inputs: The input batch
+            return_outputs: Whether to return outputs
+            num_items_in_batch: Number of items in the batch (for gradient accumulation)
         """
-        loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        # Try to call parent with num_items_in_batch if supported
+        try:
+            loss = super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+        except TypeError:
+            # Fallback for older versions that don't support num_items_in_batch
+            loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
 
         # For multi-GPU training, ensure proper loss scaling
         if self.is_distributed and self.world_size > 1:
