@@ -36,6 +36,7 @@ import os
 def run(args):
     import torch
     from unsloth import FastLanguageModel
+    from unsloth.trainer import UnslothTrainingArguments, UnslothTrainer
     from datasets import load_dataset
     from transformers.utils import strtobool
     from trl import SFTTrainer, SFTConfig
@@ -44,12 +45,14 @@ def run(args):
     import logging
     logging.getLogger('hf-to-gguf').setLevel(logging.WARNING)
 
-    # Load model and tokenizer
+    # Load model and tokenizer with multi-GPU support
+    device_map = "auto" if torch.cuda.device_count() > 1 else "sequential"
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name,
         max_seq_length=args.max_seq_length,
         dtype=args.dtype,
         load_in_4bit=args.load_in_4bit,
+        device_map=device_map,  # Enable multi-GPU support
     )
 
     # Configure PEFT model
@@ -99,8 +102,8 @@ def run(args):
     dataset = dataset.map(formatting_prompts_func, batched=True)
     print("Data is formatted and ready!")
 
-    # Configure training arguments
-    training_args = SFTConfig(
+    # Configure training arguments with multi-GPU support
+    training_args = UnslothTrainingArguments(
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_steps=args.warmup_steps,
@@ -115,17 +118,28 @@ def run(args):
         seed=args.seed,
         output_dir=args.output_dir,
         report_to=args.report_to,
-        max_length=args.max_seq_length,
+        # Multi-GPU specific settings
+        enable_distributed_training=True,
+        distributed_backend="nccl",
+        ddp_find_unused_parameters=False,
+        dataloader_pin_memory=True,
+        gradient_checkpointing=True,
+        # Legacy SFT settings
+        max_seq_length=args.max_seq_length,
         dataset_num_proc=2,
         packing=False,
     )
 
-    # Initialize trainer
-    trainer = SFTTrainer(
+    # Initialize trainer with multi-GPU support
+    trainer = UnslothTrainer(
         model=model,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         train_dataset=dataset,
         args=training_args,
+        dataset_text_field="text",
+        max_seq_length=args.max_seq_length,
+        dataset_num_proc=2,
+        packing=False,
     )
 
     # Train model

@@ -807,7 +807,10 @@ BitsAndBytesConfig__init__ = BitsAndBytesConfig__init__.replace(
 )
 exec(BitsAndBytesConfig__init__, globals())
 
-if DEVICE_COUNT == 1:
+# Multi-GPU support: Only force single GPU mode if explicitly requested
+# or if no distributed environment is detected
+import os
+if DEVICE_COUNT == 1 or os.environ.get("UNSLOTH_FORCE_SINGLE_GPU", "0") == "1":
     from accelerate.utils.dataclasses import DistributedType
     def _prepare_backend(self, *args, **kwargs): return None, DistributedType.NO
     import accelerate.state

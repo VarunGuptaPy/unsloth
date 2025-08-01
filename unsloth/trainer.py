@@ -29,6 +29,16 @@ from unsloth_zoo.vision_utils import (
 )
 from packaging.version import Version
 import dataclasses
+from .distributed_utils import (
+    is_distributed_available,
+    is_distributed_initialized,
+    get_world_size,
+    get_rank,
+    is_main_process,
+    setup_distributed_training,
+    print_distributed_info,
+    validate_distributed_environment,
+)
 
 __all__ = [
     "UnslothTrainingArguments",
@@ -68,8 +78,58 @@ except:
 pass
 
 class UnslothTrainingArguments(TrainingArguments):
-    def __init__(self, embedding_learning_rate: float = None, *args, **kwargs):
-        embedding_learning_rate = embedding_learning_rate
+    def __init__(
+        self,
+        embedding_learning_rate: float = None,
+        # Multi-GPU specific arguments
+        ddp_backend: str = None,
+        ddp_find_unused_parameters: bool = None,
+        ddp_bucket_cap_mb: int = None,
+        ddp_broadcast_buffers: bool = None,
+        dataloader_pin_memory: bool = True,
+        auto_find_batch_size: bool = False,
+        gradient_checkpointing: bool = True,
+        # Distributed training setup
+        enable_distributed_training: bool = None,
+        distributed_backend: str = "nccl",
+        *args, **kwargs
+    ):
+        # Set up distributed training if multiple GPUs are available
+        if enable_distributed_training is None:
+            enable_distributed_training = is_distributed_available()
+
+        # Configure distributed training arguments
+        if enable_distributed_training and is_distributed_available():
+            # Set default DDP parameters for optimal performance
+            if ddp_backend is None:
+                ddp_backend = distributed_backend
+            if ddp_find_unused_parameters is None:
+                ddp_find_unused_parameters = False  # Better performance for most cases
+            if ddp_bucket_cap_mb is None:
+                ddp_bucket_cap_mb = 25  # Default bucket size
+            if ddp_broadcast_buffers is None:
+                ddp_broadcast_buffers = False  # Better performance
+
+            # Update kwargs with distributed settings
+            kwargs.update({
+                "ddp_backend": ddp_backend,
+                "ddp_find_unused_parameters": ddp_find_unused_parameters,
+                "ddp_bucket_cap_mb": ddp_bucket_cap_mb,
+                "ddp_broadcast_buffers": ddp_broadcast_buffers,
+                "dataloader_pin_memory": dataloader_pin_memory,
+                "auto_find_batch_size": auto_find_batch_size,
+                "gradient_checkpointing": gradient_checkpointing,
+            })
+
+            # Print distributed info if main process
+            if is_main_process():
+                print("Unsloth: Configuring for distributed training")
+                print_distributed_info()
+
+        self.embedding_learning_rate = embedding_learning_rate
+        self.enable_distributed_training = enable_distributed_training
+        self.distributed_backend = distributed_backend
+
         super().__init__(*args, **kwargs)
 pass
 
@@ -119,9 +179,39 @@ pass
 
 
 class UnslothTrainer(SFTTrainer):
+    def __init__(self, *args, **kwargs):
+        # Setup distributed training if enabled
+        if hasattr(kwargs.get('args'), 'enable_distributed_training') and \
+           kwargs.get('args').enable_distributed_training:
+            self._setup_distributed_training(kwargs.get('args'))
+
+        super().__init__(*args, **kwargs)
+
+        # Store distributed training info
+        self.is_distributed = is_distributed_initialized()
+        self.world_size = get_world_size()
+        self.rank = get_rank()
+
+        if self.is_distributed and is_main_process():
+            print(f"Unsloth: Initialized trainer for distributed training with {self.world_size} GPUs")
+
+    def _setup_distributed_training(self, args):
+        """Setup distributed training environment."""
+        if not validate_distributed_environment():
+            return
+
+        distributed_info = setup_distributed_training(
+            backend=getattr(args, 'distributed_backend', 'nccl'),
+            timeout_minutes=30,
+        )
+
+        if is_main_process():
+            print("Unsloth: Distributed training setup complete")
+
     def create_optimizer(self):
         embedding_learning_rate = getattr(self.args, "embedding_learning_rate", None)
-        if embedding_learning_rate is None: return super().create_optimizer()
+        if embedding_learning_rate is None:
+            return super().create_optimizer()
 
         if self.optimizer is None:
             optimizer_cls, optimizer_kwargs = SFTTrainer.get_optimizer_cls_and_kwargs(self.args)
@@ -131,9 +221,94 @@ class UnslothTrainer(SFTTrainer):
                 optimizer_kwargs,
                 embedding_learning_rate,
             )
-        pass
         return self.optimizer
-    pass
+
+    def training_step(self, model, inputs):
+        """
+        Enhanced training step with multi-GPU support.
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # Use accelerator for distributed training
+        if hasattr(self, 'accelerator') and self.accelerator is not None:
+            with self.accelerator.accumulate(model):
+                loss = self.compute_loss(model, inputs)
+                self.accelerator.backward(loss)
+                return loss.detach()
+        else:
+            # Fallback to standard training step
+            return super().training_step(model, inputs)
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Enhanced loss computation with proper scaling for multi-GPU.
+        """
+        loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+
+        # For multi-GPU training, ensure proper loss scaling
+        if self.is_distributed and self.world_size > 1:
+            # Loss is already averaged across devices by DDP
+            # No additional scaling needed
+            pass
+
+        return loss
+
+    def log(self, logs):
+        """
+        Enhanced logging for multi-GPU training.
+        """
+        # Only log from main process in distributed training
+        if not self.is_distributed or is_main_process():
+            # Add distributed training info to logs
+            if self.is_distributed:
+                logs["world_size"] = self.world_size
+                logs["rank"] = self.rank
+            super().log(logs)
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        """
+        Enhanced model saving for multi-GPU training.
+        """
+        # Only save from main process in distributed training
+        if not self.is_distributed or is_main_process():
+            super().save_model(output_dir, _internal_call)
+
+        # Wait for all processes to complete saving
+        if self.is_distributed:
+            import torch.distributed as dist
+            dist.barrier()
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """
+        Enhanced evaluation for multi-GPU training.
+        """
+        # Run evaluation on all processes but only log from main process
+        eval_results = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+
+        if self.is_distributed:
+            # Synchronize evaluation results across processes
+            import torch.distributed as dist
+            dist.barrier()
+
+            # Only return results from main process
+            if not is_main_process():
+                return {}
+
+        return eval_results
+
+    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
+        """
+        Enhanced logging/saving/evaluation with multi-GPU coordination.
+        """
+        # Only perform logging/saving from main process
+        if not self.is_distributed or is_main_process():
+            super()._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+
+        # Synchronize all processes
+        if self.is_distributed:
+            import torch.distributed as dist
+            dist.barrier()
 pass
 
 # From `trl>=0.13.0`, they changed how to pass several params to the trainer

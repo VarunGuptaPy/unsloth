@@ -20,6 +20,16 @@ from ._utils import (
     USE_MODELSCOPE,
     get_transformers_model_type,
 )
+from ..distributed_utils import (
+    is_distributed_available,
+    is_distributed_initialized,
+    get_world_size,
+    get_rank,
+    get_local_rank,
+    is_main_process,
+    get_device_map_for_distributed,
+    get_optimal_device_map,
+)
 from .granite import FastGraniteModel
 from .llama   import FastLlamaModel, logger
 from .mistral import FastMistralModel
@@ -137,6 +147,25 @@ class FastLanguageModel(FastLlamaModel):
         if isinstance(dtype, str) and dtype in ["float16", "bfloat16"]:
             dtype = getattr(torch, dtype)
         assert (dtype is None or dtype == torch.float16 or dtype == torch.bfloat16)
+
+        # Handle multi-GPU device mapping
+        original_device_map = device_map
+        if device_map == "auto" and is_distributed_available():
+            if is_distributed_initialized():
+                # For distributed training, use local rank
+                device_map = get_device_map_for_distributed(model_name)
+                if is_main_process():
+                    print(f"Unsloth: Using distributed device map: {device_map}")
+            else:
+                # For multi-GPU inference without distributed training
+                device_map = get_optimal_device_map({})
+                if torch.cuda.device_count() > 1:
+                    print(f"Unsloth: Using multi-GPU device map: {device_map}")
+        elif device_map == "sequential" and torch.cuda.device_count() > 1:
+            # Keep sequential for backward compatibility but warn about multi-GPU
+            if is_main_process() or not is_distributed_initialized():
+                print(f"Unsloth: Using sequential device mapping on {torch.cuda.device_count()} GPUs. "
+                      f"Consider using device_map='auto' for better multi-GPU utilization.")
 
         if use_gradient_checkpointing == "unsloth":
             patch_unsloth_smart_gradient_checkpointing(dtype = dtype)
@@ -520,6 +549,25 @@ class FastModel(FastBaseModel):
         elif dtype == torch.bfloat16 and not SUPPORTS_BFLOAT16:
             logger.warning_once("Device does not support bfloat16. Will change to float16.")
             dtype = torch.float16
+
+        # Handle multi-GPU device mapping for FastModel
+        original_device_map = device_map
+        if device_map == "auto" and is_distributed_available():
+            if is_distributed_initialized():
+                # For distributed training, use local rank
+                device_map = get_device_map_for_distributed(model_name)
+                if is_main_process():
+                    print(f"Unsloth: Using distributed device map: {device_map}")
+            else:
+                # For multi-GPU inference without distributed training
+                device_map = get_optimal_device_map({})
+                if torch.cuda.device_count() > 1:
+                    print(f"Unsloth: Using multi-GPU device map: {device_map}")
+        elif device_map == "sequential" and torch.cuda.device_count() > 1:
+            # Keep sequential for backward compatibility but warn about multi-GPU
+            if is_main_process() or not is_distributed_initialized():
+                print(f"Unsloth: Using sequential device mapping on {torch.cuda.device_count()} GPUs. "
+                      f"Consider using device_map='auto' for better multi-GPU utilization.")
         assert(dtype in (torch.float16, torch.bfloat16, torch.float32))
 
         patch_compiled_autograd()

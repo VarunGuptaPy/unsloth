@@ -38,10 +38,9 @@ if already_imported:
     )
 pass
 
-# Unsloth currently does not work on multi GPU setups - sadly we are a 2 brother team so
-# enabling it will require much more work, so we have to prioritize. Please understand!
-# We do have a beta version, which you can contact us about!
-# Thank you for your understanding and we appreciate it immensely!
+# Unsloth now supports multi-GPU training!
+# Use device_map="auto" or specify distributed training arguments to enable multi-GPU support.
+# For distributed training, launch with: torchrun --nproc_per_node=<num_gpus> your_script.py
 
 # Fixes https://github.com/unslothai/unsloth/issues/1266
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
@@ -244,6 +243,7 @@ from .models import *
 from .models import __version__
 from .save import *
 from .chat_templates import *
+from .distributed_utils import *
 from .tokenizer_utils import *
 from .trainer import *
 
